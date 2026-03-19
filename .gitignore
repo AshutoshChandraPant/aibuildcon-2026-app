@@ -1,0 +1,6 @@
+data/
+.claude/
+node_modules/
+*.db
+*.log
+.env

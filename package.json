@@ -1,0 +1,14 @@
+{
+  "name": "aibuildcon-2026-leads",
+  "version": "1.0.0",
+  "description": "AI BuildCon 2026 Experience Booth landing page with lead capture",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "PORT=3000 ADMIN_KEY=aibuildcon2026 node server.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {}
+}
