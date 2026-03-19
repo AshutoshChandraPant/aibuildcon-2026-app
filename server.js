@@ -1,8 +1,7 @@
 /**
  * AI BuildCon 2026 — Lead Capture Server
  * ════════════════════════════════════════
- * Zero npm dependencies. Uses only Node.js built-ins +
- * Python's built-in sqlite3 (via child_process) for the database.
+ * Uses @libsql/client for database (Turso cloud or local SQLite file).
  *
  * ROUTES
  * ──────
@@ -18,7 +17,8 @@
  *  PORT           Server port              (default: 3000)
  *  ADMIN_KEY      Password for /admin      (default: aibuildcon2026)
  *  SLACK_WEBHOOK  Slack Incoming Webhook   (optional)
- *  DB_PATH        SQLite file path         (default: ./data/leads.db)
+ *  TURSO_URL      libsql DB URL            (default: file:data/leads.db)
+ *  TURSO_TOKEN    Turso auth token         (required for cloud)
  */
 
 'use strict';
@@ -28,65 +28,50 @@ const https  = require('https');
 const fs     = require('fs');
 const path   = require('path');
 const url    = require('url');
-const { execFileSync } = require('child_process');
+const { createClient } = require('@libsql/client');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const PORT          = parseInt(process.env.PORT || '3000', 10);
 const ADMIN_KEY     = process.env.ADMIN_KEY     || 'aibuildcon2026';
 const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK || '';
-const DB_PATH       = process.env.DB_PATH       || path.join(__dirname, 'data', 'leads.db');
+const TURSO_URL     = process.env.TURSO_URL     || 'file:data/leads.db';
 const PUBLIC_DIR    = path.join(__dirname, 'public');
 
 // ─── DATABASE ─────────────────────────────────────────────────────────────────
-// Thin wrapper: runs Python inline scripts with sqlite3 (no npm packages needed)
 
-function pyDB(script, args = []) {
+let _db;
+function getDB() {
+  if (!_db) {
+    _db = createClient({ url: TURSO_URL, authToken: process.env.TURSO_TOKEN });
+  }
+  return _db;
+}
+
+async function dbExec(sql, params = []) {
   try {
-    const out = execFileSync(
-      'python3', ['-c', script, ...args.map(String)],
-      { encoding: 'utf8', timeout: 5000 }
-    );
-    return JSON.parse(out.trim());
+    const result = await getDB().execute({ sql, args: params });
+    return { ok: true, lastrowid: Number(result.lastInsertRowid) };
   } catch (e) {
     console.error('[DB Error]', e.message);
     return null;
   }
 }
 
-function dbExec(sql, params = []) {
-  return pyDB(`
-import sqlite3, json, sys
-conn = sqlite3.connect(sys.argv[1])
-try:
-    conn.execute(sys.argv[2], json.loads(sys.argv[3]))
-    conn.commit()
-    print(json.dumps({"ok": True, "lastrowid": conn.execute("SELECT last_insert_rowid()").fetchone()[0]}))
-except Exception as e:
-    print(json.dumps({"ok": False, "error": str(e)}))
-finally:
-    conn.close()
-`, [DB_PATH, sql, JSON.stringify(params)]);
+async function dbAll(sql, params = []) {
+  try {
+    const result = await getDB().execute({ sql, args: params });
+    return result.rows.map(row => ({ ...row }));
+  } catch (e) {
+    console.error('[DB Error]', e.message);
+    return [];
+  }
 }
 
-function dbAll(sql, params = []) {
-  const result = pyDB(`
-import sqlite3, json, sys
-conn = sqlite3.connect(sys.argv[1])
-conn.row_factory = sqlite3.Row
-try:
-    rows = conn.execute(sys.argv[2], json.loads(sys.argv[3])).fetchall()
-    print(json.dumps([dict(r) for r in rows]))
-except Exception as e:
-    print(json.dumps([]))
-finally:
-    conn.close()
-`, [DB_PATH, sql, JSON.stringify(params)]);
-  return Array.isArray(result) ? result : [];
-}
-
-function initDB() {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  dbExec(`
+async function initDB() {
+  if (TURSO_URL.startsWith('file:')) {
+    fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+  }
+  await dbExec(`
     CREATE TABLE IF NOT EXISTS leads (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       name       TEXT    NOT NULL,
@@ -100,8 +85,8 @@ function initDB() {
       ip         TEXT    DEFAULT '',
       created_at TEXT    DEFAULT (datetime('now'))
     )
-  `, []);
-  console.log('✓ Database ready →', DB_PATH);
+  `);
+  console.log('✓ Database ready →', TURSO_URL);
 }
 
 // ─── SLACK ────────────────────────────────────────────────────────────────────
@@ -338,7 +323,7 @@ async function router(req, res) {
 
   // ── Health check
   if (method === 'GET' && pathname === '/health') {
-    const count = dbAll('SELECT COUNT(*) as c FROM leads')[0]?.c ?? 0;
+    const count = (await dbAll('SELECT COUNT(*) as c FROM leads'))[0]?.c ?? 0;
     json(res, 200, { ok: true, leads: count, uptime: process.uptime() });
     return;
   }
@@ -362,9 +347,9 @@ async function router(req, res) {
       json(res, 400, { ok: false, error: 'Invalid email address' }); return;
     }
 
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
 
-    const result = dbExec(
+    const result = await dbExec(
       `INSERT INTO leads (name, email, company, role, message, source, page_url, referrer, ip)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -385,7 +370,6 @@ async function router(req, res) {
       return;
     }
 
-    // Fire-and-forget Slack ping
     sendSlack({ name, email, company, role, message, source })
       .catch(e => console.error('[Slack]', e.message));
 
@@ -397,7 +381,7 @@ async function router(req, res) {
   // ── GET /api/leads — JSON (protected)
   if (method === 'GET' && pathname === '/api/leads') {
     if (query.key !== ADMIN_KEY) { json(res, 401, { error: 'Unauthorized' }); return; }
-    const leads = dbAll('SELECT * FROM leads ORDER BY id DESC');
+    const leads = await dbAll('SELECT * FROM leads ORDER BY id DESC');
     json(res, 200, leads);
     return;
   }
@@ -405,7 +389,7 @@ async function router(req, res) {
   // ── GET /api/leads/export — CSV download (protected)
   if (method === 'GET' && pathname === '/api/leads/export') {
     if (query.key !== ADMIN_KEY) { json(res, 401, { error: 'Unauthorized' }); return; }
-    const leads = dbAll('SELECT * FROM leads ORDER BY id DESC');
+    const leads = await dbAll('SELECT * FROM leads ORDER BY id DESC');
     const csv   = buildCSV(leads);
     res.writeHead(200, {
       'Content-Type': 'text/csv',
@@ -424,7 +408,7 @@ async function router(req, res) {
       </body></html>`);
       return;
     }
-    const leads = dbAll('SELECT * FROM leads ORDER BY id DESC');
+    const leads = await dbAll('SELECT * FROM leads ORDER BY id DESC');
     html(res, 200, buildAdminHTML(leads));
     return;
   }
@@ -442,7 +426,6 @@ async function router(req, res) {
     if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
       serveStatic(res, filePath);
     } else {
-      // SPA fallback: serve index.html for unknown routes
       serveStatic(res, path.join(PUBLIC_DIR, 'index.html'));
     }
     return;
@@ -453,29 +436,40 @@ async function router(req, res) {
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
-initDB();
-
-const server = http.createServer(async (req, res) => {
+const handler = async (req, res) => {
   try {
     await router(req, res);
   } catch (e) {
     console.error('[Unhandled]', e);
     if (!res.headersSent) json(res, 500, { error: 'Internal server error' });
   }
-});
+};
 
-server.listen(PORT, () => {
-  const line = '─'.repeat(54);
-  console.log(`\n${line}`);
-  console.log(`  🚀  AI BuildCon 2026 Lead Server`);
-  console.log(line);
-  console.log(`  Landing page  →  http://localhost:${PORT}/`);
-  console.log(`  Admin panel   →  http://localhost:${PORT}/admin?key=${ADMIN_KEY}`);
-  console.log(`  Leads JSON    →  http://localhost:${PORT}/api/leads?key=${ADMIN_KEY}`);
-  console.log(`  Export CSV    →  http://localhost:${PORT}/api/leads/export?key=${ADMIN_KEY}`);
-  console.log(`  Health        →  http://localhost:${PORT}/health`);
-  console.log(line);
-  console.log(`  Slack webhook →  ${SLACK_WEBHOOK ? '✓ configured' : '✗ not set (set SLACK_WEBHOOK env var)'}`);
-  console.log(`  Database      →  ${DB_PATH}`);
-  console.log(`${line}\n`);
-});
+if (require.main === module) {
+  // Local dev: start HTTP server
+  initDB().then(() => {
+    http.createServer(handler).listen(PORT, () => {
+      const line = '─'.repeat(54);
+      console.log(`\n${line}`);
+      console.log(`  🚀  AI BuildCon 2026 Lead Server`);
+      console.log(line);
+      console.log(`  Landing page  →  http://localhost:${PORT}/`);
+      console.log(`  Admin panel   →  http://localhost:${PORT}/admin?key=${ADMIN_KEY}`);
+      console.log(`  Leads JSON    →  http://localhost:${PORT}/api/leads?key=${ADMIN_KEY}`);
+      console.log(`  Export CSV    →  http://localhost:${PORT}/api/leads/export?key=${ADMIN_KEY}`);
+      console.log(`  Health        →  http://localhost:${PORT}/health`);
+      console.log(line);
+      console.log(`  Slack webhook →  ${SLACK_WEBHOOK ? '✓ configured' : '✗ not set (set SLACK_WEBHOOK env var)'}`);
+      console.log(`  Database      →  ${TURSO_URL}`);
+      console.log(`${line}\n`);
+    });
+  });
+} else {
+  // Vercel serverless: export handler, init DB on first request
+  let initPromise = null;
+  module.exports = async (req, res) => {
+    if (!initPromise) initPromise = initDB();
+    await initPromise;
+    return handler(req, res);
+  };
+}
